@@ -112,7 +112,9 @@ pipeline has loaded the same two months:
 
 - column names and order equal the legacy report's;
 - the set of (zone, month, service) groups is identical;
-- every measure in every group matches at `rel_tol=1e-9` (`abs_tol=1e-6` for sums that cancel to ~0).
+- every measure in every group matches at `rel_tol=1e-9` (`abs_tol=1e-6` for sums that cancel to ~0);
+- with `PARITY_RERUN=1`: rerunning the pipeline update leaves row count and every sum unchanged
+  (opt-in because it starts a real update).
 
 Before deploying, the port's SELECT was run on local Spark over the raw CSVs typed exactly as bronze
 types them: same 1,402 groups, 0 differences in every column.
@@ -125,12 +127,13 @@ Deployed to `devin_dev` with the existing bundle (`nyc_taxi` pipeline, selective
 | check | result |
 |---|---|
 | `test_legacy06.py` vs the legacy Spark report | 2/2 pass: same 13 columns in order, same 1,402 groups, 0 measures beyond tolerance |
-| module 04 parity suite on the same workspace state | 19/19 still pass (nothing else was refreshed) |
+| `test_rerun_is_idempotent` (`PARITY_RERUN=1`): rerun the whole `nyc_taxi` pipeline update with no new data | row count (1,402) and every measure sum unchanged; update `9d75103b` |
+| module 04 parity suite on the same workspace state | 19/19 still pass, before and after the rerun |
 | tags | `apply_tags` run: `spark_monthly_zone_revenue` tagged `source_module=06-batch`, everything else unchanged |
 
 Not verified:
 
-- **Late arrival / idempotency were not replayed for module 06.** The MV recomputes over all of bronze
-  with no high-water mark, so load order can't change its output; legacy has no incremental logic either.
+- **Late arrival was not replayed for module 06.** The MV recomputes over all of bronze with no
+  high-water mark, so load order can't change its output; legacy has no incremental logic either.
 - **Legacy ran on local Spark, not Dataproc,** and the BigQuery variant was not run.
 - **Two months only**, as in module 04.

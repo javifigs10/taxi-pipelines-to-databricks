@@ -5,10 +5,11 @@ Legacy chain, as taught in 06-batch:
   code/05_taxi_schema.ipynb -> data/pq/<taxi>/<yyyy>/<mm>/   (explicit schema, csv -> parquet)
   code/06_spark_sql.py      -> report parquet               (spark-submit, as in 14-creating-a-local-spark-cluster.md)
 
-The notebook cells and the script run as written. The only edits are the
-notebook's hard-coded loop parameters (year 2020/2021, months 1-12), which
-become the proof scope; the edit is printed. Needs pyspark 3.3.2 (the course
-version) and Java 17:
+The notebook cells and the script run as written. The only edit is the
+hard-coded loop in conversion cells 5 and 10 (`year = 2020`, `range(1, 13)`),
+which becomes the proof scope (2019, months 1-2 for --months 2019-01,2019-02);
+the edit is printed. The notebook's 2021 cells are not run. Needs pyspark 3.3.2
+(the course version) and Java 17:
 
   uv venv -p 3.10 ~/spark06 && VIRTUAL_ENV=~/spark06 uv pip install pyspark==3.3.2 duckdb pandas pyarrow
   ~/spark06/bin/python tests/parity/legacy06/run_legacy_06.py --months 2019-01,2019-02
@@ -37,7 +38,7 @@ CODE = REPO / "06-batch" / "code"
 NOTEBOOK = CODE / "05_taxi_schema.ipynb"
 SCRIPT = CODE / "06_spark_sql.py"
 SETUP_CELLS = (0, 1, 3, 4)          # imports, SparkSession, types, green/yellow schemas
-CONVERT_CELLS = {"green": 5, "yellow": 10}  # the year-2020 conversion loop for each taxi type
+CONVERT_CELLS = {"green": 5, "yellow": 10}  # the notebook's year-2020 loop, re-pointed at the proof scope
 MODEL = "spark_monthly_zone_revenue"
 
 
