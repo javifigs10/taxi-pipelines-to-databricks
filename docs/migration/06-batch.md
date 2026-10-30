@@ -119,4 +119,18 @@ types them: same 1,402 groups, 0 differences in every column.
 
 ## Results
 
-Not deployed yet; held until the billing question is settled.
+Deployed to `devin_dev` with the existing bundle (`nyc_taxi` pipeline, selective refresh of
+`spark_monthly_zone_revenue` only; bronze held the in-order 2019-01 + 2019-02 state):
+
+| check | result |
+|---|---|
+| `test_legacy06.py` vs the legacy Spark report | 2/2 pass: same 13 columns in order, same 1,402 groups, 0 measures beyond tolerance |
+| module 04 parity suite on the same workspace state | 19/19 still pass (nothing else was refreshed) |
+| tags | `apply_tags` run: `spark_monthly_zone_revenue` tagged `source_module=06-batch`, everything else unchanged |
+
+Not verified:
+
+- **Late arrival / idempotency were not replayed for module 06.** The MV recomputes over all of bronze
+  with no high-water mark, so load order can't change its output; legacy has no incremental logic either.
+- **Legacy ran on local Spark, not Dataproc,** and the BigQuery variant was not run.
+- **Two months only**, as in module 04.
