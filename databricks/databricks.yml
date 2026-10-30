@@ -1,0 +1,29 @@
+# Lakeflow migration of 02-workflow-orchestration (Kestra 08/09) +
+# 04-analytics-engineering/taxi_rides_ny (dbt). Design and decisions:
+# docs/migration/04-analytics-engineering.md
+bundle:
+  name: nyc_taxi
+
+include:
+  - resources/*.yml
+
+sync:
+  include:
+    - src/seeds/*.csv  # the repo .gitignore excludes *.csv; the dbt seeds must ship with the bundle
+
+variables:
+  catalog:
+    description: Unity Catalog catalog that owns every object in this bundle.
+    default: devin_dev
+  schedule_pause_status:
+    description: UNPAUSED for the daily schedule; PAUSED while running parity scenarios by hand.
+    default: UNPAUSED
+  max_month:
+    description: Last month the daily job may pick up (proof scope is 2019-01..2019-02).
+    default: "2019-02"
+
+targets:
+  dev:
+    default: true
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

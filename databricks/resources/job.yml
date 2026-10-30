@@ -1,0 +1,60 @@
+resources:
+  jobs:
+    nyc_taxi_daily:
+      name: nyc_taxi_daily
+      description: >
+        Replaces Kestra 09_gcp_taxi_scheduled. Daily: land the next month that is
+        not yet in the volume (no-op when nothing new), refresh the Lakeflow
+        pipeline, tag the outputs. Backfill/replay: run with month=yyyy-MM.
+      tags:
+        devin: "true"
+        source_module: 04-analytics-engineering
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: UTC
+        pause_status: ${var.schedule_pause_status}
+      parameters:
+        - name: month
+          default: ""
+        - name: taxis
+          default: green,yellow
+        - name: max_month
+          default: ${var.max_month}
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+      tasks:
+        - task_key: download_month
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/tasks/download_month.py
+            parameters:
+              - --catalog=${var.catalog}
+              - --landing=/Volumes/${var.catalog}/${resources.schemas.nyc_taxi_bronze.name}/${resources.volumes.landing.name}
+              - --month={{job.parameters.month}}
+              - --seeds-dir=${workspace.file_path}/src/seeds
+              - --taxis={{job.parameters.taxis}}
+              - --max-month={{job.parameters.max_month}}
+        - task_key: has_new_data
+          depends_on:
+            - task_key: download_month
+          condition_task:
+            op: EQUAL_TO
+            left: "{{tasks.download_month.values.landed}}"
+            right: "true"
+        - task_key: refresh_pipeline
+          depends_on:
+            - task_key: has_new_data
+              outcome: "true"
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.nyc_taxi.id}
+        - task_key: apply_tags
+          depends_on:
+            - task_key: refresh_pipeline
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/tasks/apply_tags.py
+            parameters:
+              - --catalog=${var.catalog}

@@ -1,0 +1,31 @@
+resources:
+  schemas:
+    nyc_taxi_bronze:
+      catalog_name: ${var.catalog}
+      name: nyc_taxi_bronze
+      comment: "Bronze: Auto Loader copies of the Kestra 08/09 monthly loads"
+      properties:
+        devin: "true"
+        source_module: 02-workflow-orchestration
+    nyc_taxi_silver:
+      catalog_name: ${var.catalog}
+      name: nyc_taxi_silver
+      comment: "Silver: dbt staging + intermediate (taxi_rides_ny)"
+      properties:
+        devin: "true"
+        source_module: 04-analytics-engineering
+    nyc_taxi_gold:
+      catalog_name: ${var.catalog}
+      name: nyc_taxi_gold
+      comment: "Gold: dbt marts (taxi_rides_ny)"
+      properties:
+        devin: "true"
+        source_module: 04-analytics-engineering
+
+  volumes:
+    landing:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.nyc_taxi_bronze.name}
+      name: landing
+      volume_type: MANAGED
+      comment: "Monthly csv.gz drops (replaces Kestra's GCS bucket); devin=true source_module=02-workflow-orchestration"

@@ -1,0 +1,20 @@
+# Profiles for the parity harness. Targets are deliberately not named `dev`,
+# which would trigger the project's January-only sample filter.
+taxi_rides_ny:
+  target: oracle
+  outputs:
+    oracle:
+      type: duckdb
+      path: "{{ env_var('ORACLE_DUCKDB_PATH') }}"
+      schema: oracle
+      threads: 4
+    dbt_ref:
+      type: databricks
+      host: "{{ env_var('DATABRICKS_HOST') | replace('https://', '') | replace('/', '') }}"
+      http_path: "/sql/1.0/warehouses/{{ env_var('DATABRICKS_WAREHOUSE_ID') }}"
+      auth_type: oauth
+      client_id: "{{ env_var('DATABRICKS_CLIENT_ID') }}"
+      client_secret: "{{ env_var('DATABRICKS_CLIENT_SECRET') }}"
+      catalog: "{{ env_var('DBT_REF_CATALOG', 'devin_dev') }}"
+      schema: dbt_ref
+      threads: 4
