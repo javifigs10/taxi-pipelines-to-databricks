@@ -1,0 +1,21 @@
+resources:
+  pipelines:
+    nyc_taxi:
+      name: nyc_taxi
+      catalog: ${var.catalog}
+      schema: ${resources.schemas.nyc_taxi_silver.name}
+      serverless: true
+      channel: CURRENT
+      photon: true
+      continuous: false
+      root_path: ../src/pipeline
+      libraries:
+        - glob:
+            include: ../src/pipeline/**
+      configuration:
+        taxi.catalog: ${var.catalog}
+        taxi.landing: /Volumes/${var.catalog}/${resources.schemas.nyc_taxi_bronze.name}/${resources.volumes.landing.name}
+        spark.sql.session.timeZone: UTC
+      tags:
+        devin: "true"
+        source_module: 04-analytics-engineering

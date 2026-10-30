@@ -1,6 +1,6 @@
 # Migration mapping: 04-analytics-engineering → Databricks
 
-Status: **design agreed, build pending.** All numbers below come from running the unmodified dbt project on DuckDB (see [Oracle](#oracle)). Statements marked *verify on deploy* are expectations about Databricks behaviour that have not been executed yet.
+Status: **built and deployed** (`databricks/`, parity harness in `tests/parity/`); results in [Implementation and parity results](#implementation-and-parity-results). Numbers in the design sections come from running the unmodified dbt project on DuckDB (see [Oracle](#oracle)); the Databricks behaviours that were marked *verify on deploy* have since been checked on serverless and are noted inline.
 
 ## Why parity before porting: the 2088 row
 
@@ -54,9 +54,9 @@ The comparison oracle for Databricks parity is the **patched oracle**: the same 
 |---|---|
 | Engine | One Lakeflow Declarative Pipeline (serverless, Unity Catalog), Python API `from pyspark import pipelines as dp` for bronze + silver, SQL files for gold. One pipeline can hold both languages, so gold and silver keep a single dependency graph. |
 | Catalog / schemas | `devin_dev.nyc_taxi_bronze`, `devin_dev.nyc_taxi_silver`, `devin_dev.nyc_taxi_gold`, all created by the bundle. Landing files go in the volume `devin_dev.nyc_taxi_bronze.landing`. |
-| Orchestration | Lakeflow Job `nyc_taxi_monthly`: task 1 `download_month` (serverless Python, params `taxi`, `month`) writes `csv.gz` to the landing volume → task 2 `refresh_pipeline`. A monthly cron replaces Kestra's `trigger.date`. Backfills are job runs with explicit `month` params, which replaces Kestra's backfill UI. |
+| Orchestration | Lakeflow Job `nyc_taxi_daily` (issue #1 asks for daily): `download_month` (serverless Python) lands the month after the latest one already in the volume, up to `max_month` → `has_new_data` (condition) → `refresh_pipeline` → `apply_tags`. A day with nothing new skips the refresh. This replaces Kestra 09's monthly `trigger.date`. Backfills are runs with an explicit `month` param, which replaces Kestra's backfill UI. |
 | Packaging | Databricks Asset Bundle under `databricks/` (pipeline, job, schemas, volume), single target `dev` → catalog `devin_dev`. |
-| Tests | dbt tests become expectations (mapping below). Uniqueness and FK tests become validation views with `expect_or_fail`, because expectations are row-level. |
+| Tests | dbt tests become expectations (mapping below). Uniqueness, FK and unique-combination tests aren't row-level, so they're rows of one validation MV `nyc_taxi_gold.dq_test_results` with an `expect_or_fail failures = 0`. |
 
 ### Where the dbt project argues against the design
 
@@ -71,7 +71,7 @@ The comparison oracle for Databricks parity is the **patched oracle**: the same 
 | Kestra `extract` (wget) | job task `download_month` | serverless Python | writes `/Volumes/devin_dev/nyc_taxi_bronze/landing/{taxi}/{taxi}_tripdata_{yyyy-MM}.csv.gz` |
 | Kestra GCS upload + external table + per-month `_tripdata_yyyy_MM` table | none | n/a | transient staging, replaced by Auto Loader |
 | Kestra `MERGE` into `{taxi}_tripdata` | `nyc_taxi_bronze.green_tripdata`, `yellow_tripdata` | streaming table (Python, Auto Loader) | explicit schema = Kestra DDL types; adds `unique_row_id`, `filename`, `_ingested_at`, `_rescued_data` (B7) |
-| seeds `taxi_zone_lookup`, `payment_type_lookup` | `nyc_taxi_silver.taxi_zone_lookup`, `payment_type_lookup` | MV (Python) | CSVs ship in the bundle and are read from the synced workspace path (*verify on deploy*) |
+| seeds `taxi_zone_lookup`, `payment_type_lookup` | `nyc_taxi_silver.taxi_zone_lookup`, `payment_type_lookup` | MV (Python) | CSVs ship in the bundle (`databricks/src/seeds`, kept byte-equal to the dbt seeds by a test); `download_month` copies them to `landing/_seeds/` and the MV reads them there. The repo `.gitignore` excludes `*.csv`, so the bundle `sync.include`s them explicitly. |
 | `stg_green_tripdata`, `stg_yellow_tripdata` (views) | same names | temporary view (Python) | casts, `vendorid is not null` filter; carries `filename`/`_ingested_at` through |
 | `int_trips_unioned` (table) | `nyc_taxi_silver.int_trips_unioned` | MV (Python) | yellow gets `trip_type = 1`, `ehail_fee = 0` |
 | `int_trips` (table) | `nyc_taxi_silver.int_trips` | MV (Python) | surrogate key + payment lookup + dedup (B2, B9) |
@@ -88,9 +88,9 @@ Macros: `safe_cast` → `try_cast` (B3). `get_trip_duration_minutes` → explici
 |---|---|---|
 | `not_null` (vendor_id, pickup_datetime, trip_id, service_type, total_amount, location_id, …) | stg, int, fct, dims, mart | `@dp.expect_or_fail` / SQL `CONSTRAINT … EXPECT (col IS NOT NULL) ON VIOLATION FAIL UPDATE` on the same columns |
 | `accepted_values` service_type ∈ {Green, Yellow} | int_trips, fct_trips, mart | `expect_or_fail service_type IN ('Green','Yellow')` |
-| `unique` (trip_id, location_id, vendor_id) | int_trips, fct_trips, dim_zones, dim_vendors | validation view `_check_unique_<model>` = keys with `count(*) > 1`, plus `expect_or_fail` on a zero-row-count column |
-| `relationships` pickup/dropoff_location_id → dim_zones | fct_trips | validation view of orphan keys + `expect_or_fail` |
-| `dbt_utils.unique_combination_of_columns` (pickup_zone, revenue_month, service_type) | mart | validation view, same pattern |
+| `unique` (trip_id, location_id, vendor_id) | int_trips, fct_trips, dim_zones, dim_vendors | row in `dq_test_results` = count of keys with `count(*) > 1`; `expect_or_fail failures = 0` |
+| `relationships` pickup/dropoff_location_id → dim_zones | fct_trips | row in `dq_test_results` = orphan key count, same expectation |
+| `dbt_utils.unique_combination_of_columns` (pickup_zone, revenue_month, service_type) | mart | row in `dq_test_results`, same expectation |
 | model contract `enforced: true` | fct_trips | explicit column list with types in the MV definition |
 
 dbt's default severity is `error` and a failure stops downstream nodes, so `FAIL UPDATE` is the closest equivalent. The parity test confirms all of these pass on the proof data, just as all 33 pass in the oracle.
@@ -103,13 +103,13 @@ Every item below is applied identically to the patched oracle and to Databricks,
 |---|---|---|---|---|
 | B1 | `fct_trips` incremental high-water mark drops late rows | Keep the mechanism (late backfills are dropped). **Bound the watermark to each load's file month**, i.e. the HWM is the max `pickup_datetime` of earlier batches that falls inside that batch's own month. | Unmodified: yellow 2019-01 contains a pickup dated **2088-01-24**, so after run 1 the HWM is 2088 and **run 2 adds 0 rows to `fct_trips`** (int_trips has 15.5M, fct_trips stays at 8.1M). Bounded: the HWM after run 1 is 2019-01-31 23:59:58; run 2 adds every Feb-file row except 44 green + 387 yellow (pre-dedup) with Jan pickups, which are still dropped as late. | Agreed: bounded cutoff. Deliberately differs from legacy, because an exact copy stops loading after the first month (see [the 2088 row](#why-parity-before-porting-the-2088-row)). |
 | B2 | `int_trips` dedup orders by `dropoff_datetime` only | Add a deterministic tiebreak: `order by dropoff_datetime, dropoff_location_id, total_amount, fare_amount, tip_amount, trip_distance, passenger_count, payment_type, rate_code_id, store_and_fwd_flag, trip_type, extra, mta_tax, tolls_amount, improvement_surcharge, ehail_fee` (all remaining columns; rows equal on all of them are interchangeable) | 392,516 rows removed by dedup either way (Yellow 373,022 groups, Green 8,995). In **21,306 groups (Yellow 16,673, Green 4,633; 42,615 rows)** the winning `dropoff_datetime` is tied and the tied rows differ, so the unmodified winner is arbitrary and can change between runs or engines. With the tiebreak the winner is fixed. Row counts are unchanged; column values can differ for up to 21,306 trips. | Agreed (your default) |
-| B3 | `safe_cast` is BigQuery-only; plain `cast` elsewhere | `try_cast` for the three `safe_cast` columns (green `ratecodeid`, `trip_type`, `payment_type`). That's the faithful translation of BigQuery `SAFE_CAST`, and with ANSI mode on (serverless default, *verify on deploy*) a plain `cast` would error. Other columns keep plain `cast` as in dbt. | 0 rows: every value in these columns casts cleanly in both months | Agreed (your default) |
+| B3 | `safe_cast` is BigQuery-only; plain `cast` elsewhere | `try_cast` for the three `safe_cast` columns (green `ratecodeid`, `trip_type`, `payment_type`). That's the faithful translation of BigQuery `SAFE_CAST`, and with ANSI mode on (verified on serverless: `cast('x' as int)` raises `CAST_INVALID_INPUT`) a plain `cast` would error. Other columns keep plain `cast` as in dbt. | 0 rows: every value in these columns casts cleanly in both months | Agreed (your default) |
 | B4 | `fct_monthly_zone_revenue.revenue_month` has only bigquery/duckdb branches, so it's an empty expression on any other adapter | Fix: `cast(date_trunc('MONTH', pickup_datetime) as date)`, which matches the BigQuery branch's type. Proposed same fix in the dbt model: `cast({{ dbt.date_trunc('month', 'pickup_datetime') }} as date)` for all adapters. | Values identical; DuckDB type changes timestamp → date | Agreed (your default) |
-| B5 | `get_trip_duration_minutes` = `dbt.datediff(..., 'minute')`. DuckDB counts minute **boundaries crossed** (10:00:59 → 10:01:01 = 1) | Copy the oracle's semantics explicitly: `timestampdiff(MINUTE, date_trunc('MINUTE', pickup), date_trunc('MINUTE', dropoff))`. A naive `timestampdiff` returns whole elapsed minutes (*verify on deploy*). | 0 vs oracle. A naive port would differ on **3,956,545 of 8,095,819 `fct_trips` rows (48.9%)**. BigQuery's behaviour for the legacy prod run isn't verified. | Agreed |
-| B6 | dbt casts amounts with `numeric`. DuckDB `numeric` = `DECIMAL(18,3)`; Spark `DECIMAL`/`NUMERIC` without precision = `DECIMAL(10,0)` (whole numbers) | Cast to `DECIMAL(18,3)` explicitly. `avg()` outputs cast to `DOUBLE`, matching DuckDB's `avg(decimal)` return type. | 0 vs oracle. A naive port would round every fare to whole dollars. | Agreed |
-| B7 | Kestra MERGE dedups on `unique_row_id` (GCP flow hashes VendorID, pickup, dropoff, PU, DO; omits fare/distance, unlike the Postgres flow) | Bronze computes the same hash (GCP column list) and keeps within-file duplicates. That matches `MERGE … WHEN NOT MATCHED INSERT`, which inserts every unmatched source row (BigQuery semantics, not executed). Re-delivering the same file is a no-op through Auto Loader file tracking, which is the idempotency MERGE gave. Rows whose hash already exists from a *different* file are kept, not dropped, plus a `warn` expectation that counts them. Hash values won't equal BigQuery's (timestamp-to-string formats differ). Nothing downstream reads them. | Within-file hash duplicates kept: green 4,682, yellow 15,981 (same as the oracle, which loads raw files directly). Cross-file collisions: **0**. | Proposed |
+| B5 | `get_trip_duration_minutes` = `dbt.datediff(..., 'minute')`. DuckDB counts minute **boundaries crossed** (10:00:59 → 10:01:01 = 1) | Copy the oracle's semantics explicitly: `timestampdiff(MINUTE, date_trunc('MINUTE', pickup), date_trunc('MINUTE', dropoff))`. A naive `timestampdiff` returns whole elapsed minutes (verified on serverless: 10:00:59 → 10:01:01 gives 0). | 0 vs oracle. A naive port would differ on **3,956,545 of 8,095,819 `fct_trips` rows (48.9%)**. BigQuery's behaviour for the legacy prod run isn't verified. | Agreed |
+| B6 | dbt casts amounts with `numeric`. DuckDB `numeric` = `DECIMAL(18,3)`; Spark `DECIMAL`/`NUMERIC` without precision = `DECIMAL(10,0)` (whole numbers) | Cast to `DECIMAL(18,3)` explicitly. `avg()` outputs cast to `DOUBLE`, matching DuckDB's `avg(decimal)` return type. `avg_monthly_trip_distance` is `cast(sum(trip_distance) as double) / count(trip_distance)`: found in parity, Spark's `avg(DECIMAL(18,3))` returns `DECIMAL(22,7)`, so the average is rounded to 7 places before the cast (446 of 823 mart rows off by more than 1e-9 relative). | 0 vs oracle. A naive port would round every fare to whole dollars. | Agreed |
+| B7 | Kestra MERGE dedups on `unique_row_id` (GCP flow hashes VendorID, pickup, dropoff, PU, DO; omits fare/distance, unlike the Postgres flow) | Bronze computes the same hash (GCP column list) and keeps within-file duplicates. That matches `MERGE … WHEN NOT MATCHED INSERT`, which inserts every unmatched source row (BigQuery semantics, not executed). Re-delivering the same file is a no-op through Auto Loader file tracking, which is the idempotency MERGE gave. Rows whose hash already exists from a *different* file are kept, not dropped. (The proposed `warn` expectation counting them was not built: a row-level expectation on a streaming table can't see other files. The count is 0 on the proof data.) Hash values won't equal BigQuery's (timestamp-to-string formats differ). Nothing downstream reads them. | Within-file hash duplicates kept: green 4,682, yellow 15,981 (same as the oracle, which loads raw files directly). Cross-file collisions: **0**. | Proposed |
 | B8 | `get_vendor_data` has no `ELSE`, so unknown vendor ids → NULL `vendor_name` | Copy exactly | 0: only vendor ids 1, 2, 4 appear | Proposed |
-| B9 | `trip_id` = `dbt_utils.generate_surrogate_key` (md5 of `-`-joined varchar casts, nulls → `_dbt_utils_surrogate_key_null_`) | Re-implement byte-for-byte so `trip_id` matches the oracle and parity can join row-for-row. Depends on Spark rendering whole-second timestamps as `yyyy-MM-dd HH:mm:ss` like DuckDB (*verify on deploy*). | 0 if the format matches; otherwise parity falls back to the natural key | Proposed |
+| B9 | `trip_id` = `dbt_utils.generate_surrogate_key` (md5 of `-`-joined varchar casts, nulls → `_dbt_utils_surrogate_key_null_`) | Re-implement byte-for-byte so `trip_id` matches the oracle and parity can join row-for-row. Depends on Spark rendering whole-second timestamps as `yyyy-MM-dd HH:mm:ss` like DuckDB (verified: `cast(timestamp as string)` gives that). | 0: `trip_id` is inside the row hash parity compares, and it matches | Done |
 | B10 | Staging `dev` sampling filter (`target.name == 'dev'` → Jan 2019 only) | Not ported. One `dev` target with two months of data needs no sampling. | n/a | Proposed |
 | B11 | Source freshness (`warn_after 24h`, `error_after 48h` on pickup columns) | Not ported. It would warn constantly on historical data. Revisit as a job health rule if this goes to production. | n/a | Proposed |
 
@@ -121,6 +121,27 @@ Every item below is applied identically to the patched oracle and to Databricks,
 - Idempotency: re-run the job for an already-loaded month. Bronze and gold counts must not change (B7).
 - All expectations pass, mirroring the 33 dbt tests.
 
-## Prerequisites before build
+## Implementation and parity results
 
-- A Databricks workspace with Unity Catalog and serverless, plus permission to create schemas/volumes in `devin_dev`. Auth for the bundle (`DATABRICKS_HOST` + token or service principal) isn't on the build machine yet.
+What was built (deployed by the `Devin` service principal, OAuth M2M, to `devin_dev`, serverless only):
+
+| Piece | Where |
+|---|---|
+| Asset Bundle: 3 schemas, `landing` volume, pipeline `nyc_taxi`, job `nyc_taxi_daily` | [`databricks/`](../../databricks/README.md) |
+| Oracle harness: Kestra-style raw loader, B1–B6 patch, scenario runner | `tests/parity/oracle/` |
+| dbt-databricks reference into `devin_dev.dbt_ref` over the same bronze tables | `tests/parity/run_dbt_ref.py` |
+| Databricks Connect parity tests | [`tests/parity/`](../../tests/parity/README.md) |
+
+Workspace objects: [job `nyc_taxi_daily`](https://dbc-b50571e1-447f.cloud.databricks.com/jobs/52470242913383?w=7474660086280085), [pipeline `nyc_taxi`](https://dbc-b50571e1-447f.cloud.databricks.com/pipelines/58fb3a98-398f-4eae-b809-2e1e1714eb0a?w=7474660086280085). Every schema, the volume, the pipeline, the job and every published table/MV carry `devin=true` and `source_module` (`02-workflow-orchestration` for bronze, `04-analytics-engineering` for the rest).
+
+Each scenario replays the load order through the real job (`download_month` → `refresh_pipeline`), then the dbt-databricks reference replays it over the same bronze files, then `pytest tests/parity` compares. Zero diff is required everywhere except the `avg_*` doubles (1e-9 relative).
+
+| Scenario | Load order | `fct_trips` oracle / dbt_ref / Lakeflow | Parity tests |
+|---|---|---|---|
+| In order | 2019-01 → 2019-02. Jan: pipeline full refresh with only the Jan files landed; Feb: job run with no parameters (the scheduled path picks the next month) | 15,500,838 / 15,500,838 / 15,500,838 (after Jan: 8,095,819 on both dbt sides) | 19/19 pass |
+| Late backfill | 2019-02 → 2019-01 | 7,405,469 / 7,405,469 / 7,405,469 (Feb alone: 7,405,445. The Jan load then adds only the 24 Jan-file rows with a pickup after the HWM of 2019-02-28 23:59:59, including the two 2088 rows; every other Jan row is dropped as late, per B1) | 19/19 pass |
+| Idempotent rerun | 2019-01 again on top of the late state | bronze, `int_trips`, `fct_trips`, mart counts and `fct_trips` amount sums identical before/after; `download_month` logged `already landed` | n/a |
+
+Job runs: late [2019-02](https://dbc-b50571e1-447f.cloud.databricks.com/jobs/52470242913383/runs/676540697109572?o=7474660086280085), [2019-01](https://dbc-b50571e1-447f.cloud.databricks.com/jobs/52470242913383/runs/1014163092688889?o=7474660086280085); idempotent [2019-01 rerun](https://dbc-b50571e1-447f.cloud.databricks.com/jobs/52470242913383/runs/189108589961453?o=7474660086280085); in order [2019-02](https://dbc-b50571e1-447f.cloud.databricks.com/jobs/52470242913383/runs/119096872801090?o=7474660086280085).
+
+Found during parity and fixed on both sides: Spark's `avg(DECIMAL(18,3))` rounding (B6). All dbt tests (as expectations plus `dq_test_results`) passed on every pipeline update.

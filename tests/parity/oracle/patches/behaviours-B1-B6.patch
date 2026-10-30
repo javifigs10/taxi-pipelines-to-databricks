@@ -1,0 +1,261 @@
+diff --git a/04-analytics-engineering/taxi_rides_ny/macros/file_month.sql b/04-analytics-engineering/taxi_rides_ny/macros/file_month.sql
+new file mode 100644
+index 0000000..1fcf161
+--- /dev/null
++++ b/04-analytics-engineering/taxi_rides_ny/macros/file_month.sql
+@@ -0,0 +1,4 @@
++{# B1: 'yellow_tripdata_2019-01.csv' -> '2019-01' #}
++{% macro file_month(filename) -%}
++replace(replace(replace({{ filename }}, 'green_tripdata_', ''), 'yellow_tripdata_', ''), '.csv', '')
++{%- endmacro %}
+diff --git a/04-analytics-engineering/taxi_rides_ny/macros/safe_cast.sql b/04-analytics-engineering/taxi_rides_ny/macros/safe_cast.sql
+index d48547b..03cd4df 100644
+--- a/04-analytics-engineering/taxi_rides_ny/macros/safe_cast.sql
++++ b/04-analytics-engineering/taxi_rides_ny/macros/safe_cast.sql
+@@ -2,6 +2,7 @@
+     {% if target.type == 'bigquery' %}
+         safe_cast({{ column }} as {{ data_type }})
+     {% else %}
+-        cast({{ column }} as {{ data_type }})
++        {#- B3: BigQuery SAFE_CAST semantics everywhere (try_cast on DuckDB and Databricks) -#}
++        try_cast({{ column }} as {{ data_type }})
+     {% endif %}
+ {% endmacro %}
+diff --git a/04-analytics-engineering/taxi_rides_ny/models/intermediate/int_trips.sql b/04-analytics-engineering/taxi_rides_ny/models/intermediate/int_trips.sql
+index f6d4a9e..dddc576 100644
+--- a/04-analytics-engineering/taxi_rides_ny/models/intermediate/int_trips.sql
++++ b/04-analytics-engineering/taxi_rides_ny/models/intermediate/int_trips.sql
+@@ -58,5 +58,10 @@ select * from cleaned_and_enriched
+ -- Deduplicate: if multiple trips match (same vendor, second, location, service), keep first
+ qualify row_number() over(
+     partition by vendor_id, pickup_datetime, pickup_location_id, service_type
+-    order by dropoff_datetime
++    -- B2: deterministic tie-break after dropoff_datetime (every remaining column, nulls last)
++    order by dropoff_datetime asc nulls last,
++        dropoff_location_id asc nulls last, total_amount asc nulls last, fare_amount asc nulls last, tip_amount asc nulls last,
++        trip_distance asc nulls last, passenger_count asc nulls last, payment_type asc nulls last, rate_code_id asc nulls last,
++        store_and_fwd_flag asc nulls last, trip_type asc nulls last, extra asc nulls last, mta_tax asc nulls last,
++        tolls_amount asc nulls last, improvement_surcharge asc nulls last, ehail_fee asc nulls last
+ ) = 1
+diff --git a/04-analytics-engineering/taxi_rides_ny/models/intermediate/int_trips_unioned.sql b/04-analytics-engineering/taxi_rides_ny/models/intermediate/int_trips_unioned.sql
+index 1e72c50..a51a7b6 100644
+--- a/04-analytics-engineering/taxi_rides_ny/models/intermediate/int_trips_unioned.sql
++++ b/04-analytics-engineering/taxi_rides_ny/models/intermediate/int_trips_unioned.sql
+@@ -22,6 +22,7 @@ with green_trips as (
+         improvement_surcharge,
+         total_amount,
+         payment_type,
++        filename,
+         'Green' as service_type
+     from {{ ref('stg_green_tripdata') }}
+ ),
+@@ -43,10 +44,11 @@ yellow_trips as (
+         mta_tax,
+         tip_amount,
+         tolls_amount,
+-        cast(0 as numeric) as ehail_fee,  -- Yellow taxis don't have ehail_fee
++        cast(0 as decimal(18,3)) as ehail_fee,  -- Yellow taxis don't have ehail_fee
+         improvement_surcharge,
+         total_amount,
+         payment_type,
++        filename,
+         'Yellow' as service_type
+     from {{ ref('stg_yellow_tripdata') }}
+ )
+diff --git a/04-analytics-engineering/taxi_rides_ny/models/marts/fct_trips.sql b/04-analytics-engineering/taxi_rides_ny/models/marts/fct_trips.sql
+index 110828b..899b40e 100644
+--- a/04-analytics-engineering/taxi_rides_ny/models/marts/fct_trips.sql
++++ b/04-analytics-engineering/taxi_rides_ny/models/marts/fct_trips.sql
+@@ -1,3 +1,4 @@
++-- depends_on: {{ ref('int_trips_unioned') }}  -- B1: referenced only in the incremental branch
+ {{
+   config(
+     materialized='incremental',
+@@ -56,6 +57,13 @@ left join {{ ref('dim_zones') }} as dz
+     on trips.dropoff_location_id = dz.location_id
+ 
+ {% if is_incremental() %}
+-  -- Only process new trips based on pickup datetime
+-  where trips.pickup_datetime > (select max(pickup_datetime) from {{ this }})
++  -- B1: bounded high-water mark. Only pickups of earlier loads that fall inside
++  -- their own file month count, so a 2088 typo can no longer freeze the table.
++  -- Late trips (pickup <= HWM) are still dropped, as in the legacy pipeline.
++  where trips.pickup_datetime > (
++    select coalesce(max(u.pickup_datetime), cast('1900-01-01' as timestamp))
++    from {{ ref('int_trips_unioned') }} as u
++    where {{ file_month('u.filename') }} != '{{ var("batch_file_month") }}'
++      and substr(cast(u.pickup_datetime as {{ dbt.type_string() }}), 1, 7) = {{ file_month('u.filename') }}
++  )
+ {% endif %}
+diff --git a/04-analytics-engineering/taxi_rides_ny/models/marts/reporting/fct_monthly_zone_revenue.sql b/04-analytics-engineering/taxi_rides_ny/models/marts/reporting/fct_monthly_zone_revenue.sql
+index 57796b6..90f9cde 100644
+--- a/04-analytics-engineering/taxi_rides_ny/models/marts/reporting/fct_monthly_zone_revenue.sql
++++ b/04-analytics-engineering/taxi_rides_ny/models/marts/reporting/fct_monthly_zone_revenue.sql
+@@ -5,9 +5,8 @@
+ select
+     -- Grouping dimensions
+     coalesce(pickup_zone, 'Unknown Zone') as pickup_zone,
+-    {% if target.type == 'bigquery' %}cast(date_trunc(pickup_datetime, month) as date)
+-    {% elif target.type == 'duckdb' %}date_trunc('month', pickup_datetime)
+-    {% endif %} as revenue_month,
++    -- B4: portable on every adapter (the original had no Databricks branch)
++    cast({{ dbt.date_trunc('month', 'pickup_datetime') }} as date) as revenue_month,
+     service_type,
+ 
+     -- Revenue breakdown (summed by zone, month, and service type)
+@@ -22,8 +21,8 @@ select
+ 
+     -- Additional metrics for operational analysis
+     count(trip_id) as total_monthly_trips,
+-    avg(passenger_count) as avg_monthly_passenger_count,
+-    avg(trip_distance) as avg_monthly_trip_distance
++    cast(avg(passenger_count) as double) as avg_monthly_passenger_count,
++    cast(sum(trip_distance) as double) / count(trip_distance) as avg_monthly_trip_distance
+ 
+ from {{ ref('fct_trips') }}
+ group by pickup_zone, revenue_month, service_type
+\ No newline at end of file
+diff --git a/04-analytics-engineering/taxi_rides_ny/models/marts/schema.yml b/04-analytics-engineering/taxi_rides_ny/models/marts/schema.yml
+index e9cfd3a..0690412 100644
+--- a/04-analytics-engineering/taxi_rides_ny/models/marts/schema.yml
++++ b/04-analytics-engineering/taxi_rides_ny/models/marts/schema.yml
+@@ -97,7 +97,7 @@ models:
+         data_type: integer
+       - name: trip_distance
+         description: Trip distance in miles
+-        data_type: numeric
++        data_type: decimal(18,3)
+       - name: trip_type
+         description: Trip type (1=Street-hail, 2=Dispatch)
+         data_type: integer
+@@ -106,28 +106,28 @@ models:
+         data_type: bigint
+       - name: fare_amount
+         description: Time and distance fare
+-        data_type: numeric
++        data_type: decimal(18,3)
+       - name: extra
+         description: Miscellaneous extras and surcharges
+-        data_type: numeric
++        data_type: decimal(18,3)
+       - name: mta_tax
+         description: MTA tax
+-        data_type: numeric
++        data_type: decimal(18,3)
+       - name: tip_amount
+         description: Tip amount (credit card only)
+-        data_type: numeric
++        data_type: decimal(18,3)
+       - name: tolls_amount
+         description: Total tolls paid
+-        data_type: numeric
++        data_type: decimal(18,3)
+       - name: ehail_fee
+         description: E-hail service fee
+-        data_type: numeric
++        data_type: decimal(18,3)
+       - name: improvement_surcharge
+         description: Improvement surcharge
+-        data_type: numeric
++        data_type: decimal(18,3)
+       - name: total_amount
+         description: Total amount charged
+-        data_type: numeric
++        data_type: decimal(18,3)
+         data_tests:
+           - not_null
+       - name: payment_type
+diff --git a/04-analytics-engineering/taxi_rides_ny/models/staging/sources.yml b/04-analytics-engineering/taxi_rides_ny/models/staging/sources.yml
+index d6a676b..596ce5d 100644
+--- a/04-analytics-engineering/taxi_rides_ny/models/staging/sources.yml
++++ b/04-analytics-engineering/taxi_rides_ny/models/staging/sources.yml
+@@ -4,12 +4,16 @@ sources:
+     database: |
+       {%- if target.type == 'bigquery' -%}
+         {{ env_var('GCP_PROJECT_ID', 'please-add-your-gcp-project-id-here') }}
++      {%- elif target.type == 'databricks' -%}
++        {{ env_var('DBT_RAW_CATALOG', 'devin_dev') }}
+       {%- else -%}
+         taxi_rides_ny
+       {%- endif -%}
+     schema: |
+       {%- if target.type == 'bigquery' -%}
+         nytaxi
++      {%- elif target.type == 'databricks' -%}
++        {{ env_var('DBT_RAW_SCHEMA', 'dbt_ref_src') }}
+       {%- else -%}
+         prod
+       {%- endif -%}
+diff --git a/04-analytics-engineering/taxi_rides_ny/models/staging/stg_green_tripdata.sql b/04-analytics-engineering/taxi_rides_ny/models/staging/stg_green_tripdata.sql
+index 2621932..31b4bac 100644
+--- a/04-analytics-engineering/taxi_rides_ny/models/staging/stg_green_tripdata.sql
++++ b/04-analytics-engineering/taxi_rides_ny/models/staging/stg_green_tripdata.sql
+@@ -14,21 +14,24 @@ renamed as (
+         cast(lpep_pickup_datetime as timestamp) as pickup_datetime,  -- lpep = Licensed Passenger Enhancement Program (green taxis)
+         cast(lpep_dropoff_datetime as timestamp) as dropoff_datetime,
+ 
++        -- B1: load provenance (Kestra file name -> file month)
++        cast(filename as {{ dbt.type_string() }}) as filename,
++
+         -- trip info
+         cast(store_and_fwd_flag as string) as store_and_fwd_flag,
+         cast(passenger_count as integer) as passenger_count,
+-        cast(trip_distance as numeric) as trip_distance,
++        cast(trip_distance as decimal(18,3)) as trip_distance,
+         {{ safe_cast('trip_type', 'integer') }} as trip_type,
+ 
+         -- payment info
+-        cast(fare_amount as numeric) as fare_amount,
+-        cast(extra as numeric) as extra,
+-        cast(mta_tax as numeric) as mta_tax,
+-        cast(tip_amount as numeric) as tip_amount,
+-        cast(tolls_amount as numeric) as tolls_amount,
+-        cast(ehail_fee as numeric) as ehail_fee,
+-        cast(improvement_surcharge as numeric) as improvement_surcharge,
+-        cast(total_amount as numeric) as total_amount,
++        cast(fare_amount as decimal(18,3)) as fare_amount,
++        cast(extra as decimal(18,3)) as extra,
++        cast(mta_tax as decimal(18,3)) as mta_tax,
++        cast(tip_amount as decimal(18,3)) as tip_amount,
++        cast(tolls_amount as decimal(18,3)) as tolls_amount,
++        cast(ehail_fee as decimal(18,3)) as ehail_fee,
++        cast(improvement_surcharge as decimal(18,3)) as improvement_surcharge,
++        cast(total_amount as decimal(18,3)) as total_amount,
+         {{ safe_cast('payment_type', 'integer') }} as payment_type
+     from source
+     -- Filter out records with null vendor_id (data quality requirement)
+diff --git a/04-analytics-engineering/taxi_rides_ny/models/staging/stg_yellow_tripdata.sql b/04-analytics-engineering/taxi_rides_ny/models/staging/stg_yellow_tripdata.sql
+index 9419819..9070969 100644
+--- a/04-analytics-engineering/taxi_rides_ny/models/staging/stg_yellow_tripdata.sql
++++ b/04-analytics-engineering/taxi_rides_ny/models/staging/stg_yellow_tripdata.sql
+@@ -14,19 +14,22 @@ renamed as (
+         cast(tpep_pickup_datetime as timestamp) as pickup_datetime,  -- tpep = Taxicab Passenger Enhancement Program (yellow taxis)
+         cast(tpep_dropoff_datetime as timestamp) as dropoff_datetime,
+ 
++        -- B1: load provenance (Kestra file name -> file month)
++        cast(filename as {{ dbt.type_string() }}) as filename,
++
+         -- trip info
+         cast(store_and_fwd_flag as string) as store_and_fwd_flag,
+         cast(passenger_count as integer) as passenger_count,
+-        cast(trip_distance as numeric) as trip_distance,
++        cast(trip_distance as decimal(18,3)) as trip_distance,
+ 
+         -- payment info
+-        cast(fare_amount as numeric) as fare_amount,
+-        cast(extra as numeric) as extra,
+-        cast(mta_tax as numeric) as mta_tax,
+-        cast(tip_amount as numeric) as tip_amount,
+-        cast(tolls_amount as numeric) as tolls_amount,
+-        cast(improvement_surcharge as numeric) as improvement_surcharge,
+-        cast(total_amount as numeric) as total_amount,
++        cast(fare_amount as decimal(18,3)) as fare_amount,
++        cast(extra as decimal(18,3)) as extra,
++        cast(mta_tax as decimal(18,3)) as mta_tax,
++        cast(tip_amount as decimal(18,3)) as tip_amount,
++        cast(tolls_amount as decimal(18,3)) as tolls_amount,
++        cast(improvement_surcharge as decimal(18,3)) as improvement_surcharge,
++        cast(total_amount as decimal(18,3)) as total_amount,
+         cast(payment_type as integer) as payment_type
+ 
+     from source

@@ -1,0 +1,9 @@
+# Python 3.12 (databricks-connect 18 needs it): uv venv -p 3.12 .venv && uv pip install -r tests/parity/requirements.txt
+databricks-connect>=18,<19
+dbt-core>=1.10,<2
+dbt-duckdb>=1.9,<2
+dbt-databricks>=1.10,<2
+duckdb>=1.2
+pandas
+pyarrow
+pytest
