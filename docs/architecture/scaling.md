@@ -68,7 +68,7 @@ So the monthly refresh cost grows with total history, and the cumulative cost of
 
 ### 3.1 `fct_trips` full recompute
 
-**How it works today.** `fct_trips` is a declarative MV that re-derives the dbt incremental result from load provenance (ADR-0001). The `last_merge` CTE joins every distinct trip to every load batch on `b.batch_seq = 1 OR k.pickup_datetime > coalesce(b.hwm, …)`. There is no equality key in that condition. I expect Spark to run it as a broadcast nested-loop join (B is tiny, so it broadcasts), but I haven't confirmed that with `EXPLAIN`.
+**How it works today.** `fct_trips` is a declarative MV that re-derives the dbt incremental result from load provenance (ADR-0001). The `last_merge` CTE joins every distinct trip to every load batch on `b.batch_seq = 1 OR k.pickup_datetime > coalesce(b.hwm, …)`. There is no equality key in that condition. `EXPLAIN FORMATTED` confirms Spark runs it as a `PhotonBroadcastNestedLoopJoin Inner BuildRight` with join condition `(batch_seq = 1) OR (pickup_datetime > coalesce(hwm, 1900-01-01))`: every distinct trip is checked against every broadcast batch. **Step 1 below is now built** (ADR-0021).
 
 **What breaks.**
 - **At 10×** it's slower but works: about 160M × 20 ≈ 3.2B predicate evaluations, plus a full group-by and window over 160M rows, once a month. I'd expect minutes, not hours. That's an estimate, not a measurement.
@@ -76,6 +76,8 @@ So the monthly refresh cost grows with total history, and the cumulative cost of
 
 **What I'd do, in two steps.**
 1. **Remove the D × B term and keep the MV.** For a trip with pickup `p`, the last merge is the highest `batch_seq` among batches with `hwm < p`, plus batch 1. That's a step function of `p` with at most B steps. Precompute it from `load_batches` (B rows: `hwm` ascending, running max of `batch_seq`) and look up each trip with a range join. The work drops from D × B to about D log B. The semantics don't change, so the existing parity harness proves it: zero diff against the DuckDB oracle in both load orders is the acceptance test.
+   **As built (ADR-0021)** it's bucketed by month instead of a range join, because a batch's `hwm` is always the last in-month pickup of an earlier file: batches whose `hwm` is before the trip's pickup month always qualify (`month_base`, months × B rows), and only batches whose `hwm` falls inside that month need the timestamp test (`month_steps`). Both joins to the 15.5M trips are equi-joins on the month, broadcast. The nested loop is left only on the months × batches side (a few hundred rows at 100×).
+   **Measured.** Plan before/after and timings are in ADR-0021. At B = 2 the refresh time didn't move (`fct_trips` flow 28–31 s before, 27 s after), as expected: the D × B term is small when B is 2. On a synthetic 200-batch `load_batches` over the real 15.5M trips, the `last_merge` step took 10.7 s old vs 3.3 s new, with identical output.
 2. **Make `fct_trips` incremental by batch.** Under B1, a load only inserts or overwrites trips whose pickup is above the previous high-water mark. History rows only change when a later batch carries the same `trip_id` above its HWM, which in practice means future-dated rows like the 2088 trips. That's exactly the shape of a keyed upsert: a streaming table fed by an AUTO CDC flow (`dp.create_auto_cdc_flow`, keys `trip_id`, `sequence_by` `(batch_seq, -dedup_rank)` so the latest batch wins and, within it, the B2 winner), with the HWM filter applied in the source flow. It stays declarative and inside the pipeline. The side `MERGE` task you rejected stays rejected. This needs an append-only per-batch feed out of silver, so it goes together with 3.3.
 
 **When it's worth it.**
@@ -148,9 +150,9 @@ The row-count thresholds (500M, 1B) are my estimates of where those times are hi
 
 ## 5. What I'd do now rather than later
 
-Nothing needs to change for performance at today's size. A refresh takes about 2.5–3.5 minutes, once a month. Two things are worth doing before more data goes in, because they get more expensive later. **Neither is built.** Both wait for your go-ahead.
+Nothing needs to change for performance at today's size. A refresh takes about 2.5–3.5 minutes, once a month. Two things are worth doing before more data goes in, because they get more expensive later. Both have since been built.
 
-1. **Monitoring, now.** Schedule the duration query above with an alert on the section 4 thresholds, plus a weekly `count(*)` on `load_batches`. Without it, the switch points above are guesses that nobody checks. Cost: one small query a day on the warehouse.
-2. **3.1 step 1 (the `fct_trips` step-function lookup), before `max_month` is raised past a handful of months or any backfill starts.** It's the only cost that grows with the number of loads, so a backfill is when it bites. It's also cheapest to prove now: the DuckDB oracle, both load-order scenarios and the parity suite exist and run in minutes on two months. Proving the same rewrite later means rerunning the oracle at the larger size.
+1. **Monitoring, now.** *Built:* the `check_refresh` job task (see [runbook](../operations/runbook.md)). Originally: schedule the duration query above with an alert on the section 4 thresholds, plus a weekly `count(*)` on `load_batches`. Without it, the switch points above are guesses that nobody checks. Cost: one small query a day on the warehouse.
+2. *Built (ADR-0021).* **3.1 step 1 (the `fct_trips` step-function lookup), before `max_month` is raised past a handful of months or any backfill starts.** It's the only cost that grows with the number of loads, so a backfill is when it bites. It's also cheapest to prove now: the DuckDB oracle, both load-order scenarios and the parity suite exist and run in minutes on two months. Proving the same rewrite later means rerunning the oracle at the larger size.
 
 One more thing I'd do before trusting any of the 10× numbers: **a single 10× load test** (for example green + yellow for all of 2019 and 2020) through the existing job and parity harness. That replaces this section's estimates with measurements. It costs DBUs and a pipeline run, so it's a build step, not part of this pass.

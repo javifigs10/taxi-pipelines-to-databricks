@@ -18,6 +18,9 @@ variables:
   schedule_pause_status:
     description: UNPAUSED for the daily schedule; PAUSED while running parity scenarios by hand.
     default: UNPAUSED
+  alert_email:
+    description: Who gets job/pipeline failure, duration and quarantine alerts.
+    default: javifigs10@gmail.com
   max_month:
     description: Last month the daily job may pick up (proof scope is 2019-01..2019-02).
     default: "2019-02"

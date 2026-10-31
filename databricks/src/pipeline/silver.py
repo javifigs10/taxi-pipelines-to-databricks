@@ -69,18 +69,19 @@ def staging(taxi: str):
         cols.append(safe("trip_type").alias("trip_type"))
     cols += [F.col(c).cast(AMOUNT).alias(c) for c in AMOUNT_COLUMNS if taxi == "green" or c != "ehail_fee"]
     cols += [safe("payment_type").alias("payment_type"), F.col("_file_modified_at")]
-    return src.where(F.col("vendorid").isNotNull()).select(*cols)
+    # dbt filtered `vendorid is not null` here; those rows now go to quarantine_trips instead (ADR-0020)
+    return src.select(*cols)
 
 
 @dp.temporary_view(name="stg_green_tripdata", comment="dbt stg_green_tripdata")
-@dp.expect_all_or_fail({"vendor_id_not_null": "vendor_id is not null",
+@dp.expect_all({"vendor_id_not_null": "vendor_id is not null",
                         "pickup_datetime_not_null": "pickup_datetime is not null"})
 def stg_green_tripdata():
     return staging("green")
 
 
 @dp.temporary_view(name="stg_yellow_tripdata", comment="dbt stg_yellow_tripdata")
-@dp.expect_all_or_fail({"vendor_id_not_null": "vendor_id is not null",
+@dp.expect_all({"vendor_id_not_null": "vendor_id is not null",
                         "pickup_datetime_not_null": "pickup_datetime is not null"})
 def stg_yellow_tripdata():
     return staging("yellow")
@@ -92,16 +93,52 @@ UNIONED_COLUMNS = ["vendor_id", "rate_code_id", "pickup_location_id", "dropoff_l
                    *AMOUNT_COLUMNS[:5], "ehail_fee", *AMOUNT_COLUMNS[6:], "payment_type", "filename", "service_type"]
 
 
-@dp.materialized_view(name="int_trips_unioned", comment="dbt int_trips_unioned + load provenance",
-                      table_properties=TAGS)
-def int_trips_unioned():
+# Row-level checks (the data-driven dbt not_null / relationships tests). A row that breaks one
+# is kept in quarantine_trips and left out of int_trips_unioned and everything after it, instead
+# of failing the update (ADR-0020). The FAIL expectations further down can then only trip on a bug.
+QUARANTINE_RULES = {
+    "vendor_id_not_null": "vendor_id IS NOT NULL",
+    "pickup_datetime_not_null": "pickup_datetime IS NOT NULL",
+    "total_amount_not_null": "total_amount IS NOT NULL",
+    "file_month_valid": "file_month RLIKE '^[0-9]{4}-[0-9]{2}$'",
+    "pickup_location_known": "pickup_location_id IS NULL OR _pu_known",
+    "dropoff_location_known": "dropoff_location_id IS NULL OR _do_known",
+}
+
+
+@dp.temporary_view(name="trips_checked", comment="dbt int_trips_unioned before quarantine, with failed rule names")
+def trips_checked():
     green = spark.read.table("stg_green_tripdata").withColumn("service_type", F.lit("Green"))  # noqa: F821
     yellow = (spark.read.table("stg_yellow_tripdata")  # noqa: F821
               .withColumn("trip_type", F.lit(1).cast("int"))
               .withColumn("ehail_fee", F.lit(0).cast(AMOUNT))
               .withColumn("service_type", F.lit("Yellow")))
     cols = [*UNIONED_COLUMNS, "_file_modified_at"]
-    return green.select(*cols).unionByName(yellow.select(*cols)).withColumn("file_month", file_month())
+    u = green.select(*cols).unionByName(yellow.select(*cols)).withColumn("file_month", file_month())
+    ids = spark.read.table("taxi_zone_lookup").select("locationid").distinct()  # noqa: F821
+    for side, flag in [("pickup", "_pu_known"), ("dropoff", "_do_known")]:
+        known = ids.select(F.col("locationid").alias(f"{side}_location_id"), F.lit(True).alias(flag))
+        u = u.join(F.broadcast(known), f"{side}_location_id", "left")
+    failed = [F.when(F.coalesce(F.expr(rule), F.lit(False)), F.lit(None).cast("string")).otherwise(F.lit(name))
+              for name, rule in QUARANTINE_RULES.items()]
+    return u.withColumn("_failed_rules", F.array_compact(F.array(*failed)))
+
+
+@dp.materialized_view(name="int_trips_unioned", comment="dbt int_trips_unioned + load provenance",
+                      table_properties=TAGS)
+def int_trips_unioned():
+    return (spark.read.table("trips_checked")  # noqa: F821
+            .where(F.size("_failed_rules") == 0)
+            .select(*UNIONED_COLUMNS, "_file_modified_at", "file_month"))
+
+
+@dp.materialized_view(
+    name="quarantine_trips", table_properties=TAGS,
+    comment="Rows that broke a row-level check, kept for inspection; excluded from int_trips_unioned (ADR-0020)")
+def quarantine_trips():
+    return (spark.read.table("trips_checked")  # noqa: F821
+            .where(F.size("_failed_rules") > 0)
+            .select(F.col("_failed_rules").alias("failed_rules"), *UNIONED_COLUMNS, "file_month", "_file_modified_at"))
 
 
 @dp.materialized_view(

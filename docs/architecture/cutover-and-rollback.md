@@ -4,7 +4,7 @@ Status: **plan only. Nothing here is built or deployed.**
 
 Assumption from the brief: a BI dashboard and a downstream job both read the gold marts today (`fct_trips`, `fct_monthly_zone_revenue`, and the Spark report that `spark_monthly_zone_revenue` replaces). The legacy side is Kestra 08/09 → BigQuery → dbt, plus the module 06 Spark job.
 
-**Caveat that shapes the whole plan:** we have never run the legacy BigQuery pipeline. Every parity result so far compares Lakeflow with dbt on DuckDB and with Spark on a local machine. The first time the gate below runs, legacy production becomes the oracle for the first time. Expect findings the size of the 2088 row.
+**Out of scope: the legacy BigQuery side.** There is no GCP in this environment, so nothing here was or will be run against BigQuery, and Lakehouse Federation to BigQuery isn't evaluated. This plan describes the procedure a team with both platforms would follow. In this repo, the oracles stand in for legacy: dbt on DuckDB, and Spark on a local machine. The caveat still holds: we never ran the legacy BigQuery pipeline. Wherever a real cutover runs the gate below, it is the first time legacy production is the oracle, so expect findings the size of the 2088 row.
 
 ## 1. Principles
 
@@ -30,7 +30,7 @@ Assumption from the brief: a BI dashboard and a downstream job both read the gol
 - **Same inputs.** Both sides ingest the same monthly files. `download_month` records each file's SHA-256 and row count. The parity job compares them with the files Kestra loaded (BigQuery raw tables keep `filename`). If the inputs differ, mart parity means nothing.
 - **Lakeflow in its own production catalog.** Add a `prod` bundle target (for example catalog `taxi_prod`), run as a dedicated production service principal, schedule unpaused. `devin_dev` stays the sandbox. Today the bundle only has `dev`.
 - **Legacy stays the system of record** for the whole shadow period. Nothing about it changes.
-- **Legacy data reachable from Databricks.** The parity job and the serving views need to read the legacy marts. Preferred: Lakehouse Federation to BigQuery (a foreign catalog, read-only). Fallback: a daily export of the legacy marts to parquet in a volume. **I haven't checked federation availability on this workspace** (it's Free Edition).
+- **Legacy data reachable from Databricks.** The parity job and the serving views need to read the legacy marts, either through Lakehouse Federation or a daily export into a volume. That's out of scope here (no GCP, see above).
 - **Serving layer.** One view per consumed mart in `taxi_serving`, with exactly the column names and types consumers read today. Where Lakeflow's types differ from legacy, the Lakeflow-side view casts back:
   - `revenue_month` is a date on Lakeflow (ADR-0004).
   - The Spark report's typo'd column names are already kept (ADR-0016).

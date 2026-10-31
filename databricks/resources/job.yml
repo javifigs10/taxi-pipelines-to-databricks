@@ -10,6 +10,16 @@ resources:
         devin: "true"
         source_module: 04-analytics-engineering
       max_concurrent_runs: 1
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+        on_duration_warning_threshold_exceeded:
+          - ${var.alert_email}
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 3600
       schedule:
         quartz_cron_expression: "0 0 6 * * ?"
         timezone_id: UTC
@@ -50,6 +60,18 @@ resources:
               outcome: "true"
           pipeline_task:
             pipeline_id: ${resources.pipelines.nyc_taxi.id}
+        - task_key: check_refresh
+          depends_on:
+            - task_key: refresh_pipeline
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/tasks/check_refresh.py
+            parameters:
+              - --catalog=${var.catalog}
+              - --pipeline-id=${resources.pipelines.nyc_taxi.id}
+              - --max-update-seconds=3600
+              - --max-fct-trips-seconds=900
+              - --max-dedup-seconds=1200
         - task_key: apply_tags
           depends_on:
             - task_key: refresh_pipeline

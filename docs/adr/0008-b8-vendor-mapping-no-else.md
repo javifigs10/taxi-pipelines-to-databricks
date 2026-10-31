@@ -1,6 +1,6 @@
 # ADR-0008: Keep the vendor mapping without an `ELSE`
 
-- **Status:** **Proposed.** Implemented and merged in [PR #4](https://github.com/javifigs10/taxi-pipelines-to-databricks/pull/4), but never explicitly signed off; the migration doc still lists it as Proposed. Accept or reject in review.
+- **Status:** **Accepted** 2026-10-31. The user approved it earlier and approved it again on this date. Implemented in [PR #4](https://github.com/javifigs10/taxi-pipelines-to-databricks/pull/4).
 - **Behaviour:** B8 in [04-analytics-engineering.md](../migration/04-analytics-engineering.md#behaviours-we-copied-on-purpose-and-the-ones-we-didnt)
 - **Decided:** implemented in [PR #4](https://github.com/javifigs10/taxi-pipelines-to-databricks/pull/4)
 - **Differs from legacy output:** No.
