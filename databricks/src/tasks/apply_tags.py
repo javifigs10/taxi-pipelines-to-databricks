@@ -9,7 +9,9 @@ from databricks.sdk.runtime import spark
 
 SOURCE_MODULE = {"nyc_taxi_bronze": "02-workflow-orchestration",
                  "nyc_taxi_silver": "04-analytics-engineering",
-                 "nyc_taxi_gold": "04-analytics-engineering"}
+                 "nyc_taxi_gold": "04-analytics-engineering",
+                 "nyc_taxi_ops": "ops"}
+TABLE_MODULE = {("nyc_taxi_gold", "spark_monthly_zone_revenue"): "06-batch"}
 KIND = {"MATERIALIZED_VIEW": "MATERIALIZED VIEW", "STREAMING_TABLE": "STREAMING TABLE",
         "MANAGED": "TABLE", "EXTERNAL": "TABLE", "VIEW": "VIEW"}
 
@@ -30,7 +32,7 @@ def main() -> None:
             f"WHERE table_schema = '{schema}' AND table_name NOT LIKE '\\_\\_%'").collect()  # skip pipeline internals
         for r in rows:
             stmts.append(f"ALTER {KIND.get(r.table_type, 'TABLE')} {a.catalog}.{schema}.`{r.table_name}` "
-                         f"SET TAGS {tags(module)}")
+                         f"SET TAGS {tags(TABLE_MODULE.get((schema, r.table_name), module))}")
     failed = []
     for s in stmts:
         try:

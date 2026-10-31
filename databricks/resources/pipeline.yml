@@ -16,6 +16,13 @@ resources:
         taxi.catalog: ${var.catalog}
         taxi.landing: /Volumes/${var.catalog}/${resources.schemas.nyc_taxi_bronze.name}/${resources.volumes.landing.name}
         spark.sql.session.timeZone: UTC
+      notifications:
+        - email_recipients:
+            - ${var.alert_email}
+          alerts:
+            - on-update-failure
+            - on-update-fatal-failure
+            - on-flow-failure
       tags:
         devin: "true"
         source_module: 04-analytics-engineering
