@@ -97,6 +97,8 @@ dbt's default severity is `error` and a failure stops downstream nodes, so `FAIL
 
 ## Behaviours we copied on purpose (and the ones we didn't)
 
+Each row is recorded as an ADR in [`docs/adr/`](../adr/README.md) (B1 = ADR-0001 … B11 = ADR-0011).
+
 Every item below is applied identically to the patched oracle and to Databricks, so parity measures the migration and not the decisions. The "Diff vs unmodified" column is what changes against the legacy baseline.
 
 | # | Behaviour | Decision | Diff vs unmodified (2019-01/02) | Status |
