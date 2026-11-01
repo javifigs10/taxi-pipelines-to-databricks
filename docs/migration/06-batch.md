@@ -88,6 +88,8 @@ What that means:
 
 ## Behaviours we copied on purpose
 
+Each item is recorded as an ADR in [`docs/adr/`](../adr/README.md) (S1 = ADR-0012 … S8 = ADR-0019).
+
 - **S1 No dedup, no vendor filter.** The Spark job sums every raw row. Copied: that is the job.
 - **S2 Zone id grain.** `revenue_zone` is `PULocationID`; no zone lookup. Copied.
 - **S3 `revenue_month` stays a timestamp.** `date_trunc('month', …)` works on Databricks as written;

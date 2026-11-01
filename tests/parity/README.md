@@ -32,6 +32,10 @@ export DATABRICKS_HOST=... DATABRICKS_CLIENT_ID=... DATABRICKS_CLIENT_SECRET=...
 PARITY_SCENARIO=in_order ~/dbc/bin/pytest tests/parity -v
 ```
 
+## DBU-free tests (CI)
+
+`.github/workflows/ci.yml` runs these on every PR against main: `ruff`, `tests/unit` (the `fct_trips` last-merge rewrite checked against the B1 definition on DuckDB) and `test_bundle_seeds.py`, plus `databricks bundle validate` over GitHub OIDC. Everything else in this folder needs serverless compute and stays manual.
+
 ## What the tests check
 
 - `test_lakeflow_matches_duckdb_oracle`: every published model, every row. Per

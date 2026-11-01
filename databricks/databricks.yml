@@ -11,6 +11,12 @@ sync:
   include:
     - src/seeds/*.csv  # the repo .gitignore excludes *.csv; the dbt seeds must ship with the bundle
 
+# Run-as principal: CAN_RUN = read on the bundle's workspace files, CAN_RUN on the
+# pipeline (the job's pipeline_task starts updates as it), CAN_MANAGE_RUN on the job.
+permissions:
+  - service_principal_name: ${var.run_as_sp}
+    level: CAN_RUN
+
 variables:
   catalog:
     description: Unity Catalog catalog that owns every object in this bundle.
@@ -18,6 +24,12 @@ variables:
   schedule_pause_status:
     description: UNPAUSED for the daily schedule; PAUSED while running parity scenarios by hand.
     default: UNPAUSED
+  alert_email:
+    description: Who gets job/pipeline failure, duration and quarantine alerts.
+    default: javifigs10@gmail.com
+  run_as_sp:
+    description: Application ID of the operate service principal the job and pipeline run as (docs/operations/permissions.md).
+    default: 6432d72f-ea90-4201-a365-27d358d9f0ff
   max_month:
     description: Last month the daily job may pick up (proof scope is 2019-01..2019-02).
     default: "2019-02"

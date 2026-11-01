@@ -49,20 +49,35 @@ candidates AS (
   SELECT * FROM ${taxi.catalog}.nyc_taxi_silver.int_trips_candidates
 ),
 batches AS (
-  SELECT batch_seq, hwm FROM ${taxi.catalog}.nyc_taxi_silver.load_batches
+  SELECT batch_seq, coalesce(hwm, TIMESTAMP '1900-01-01') AS hwm FROM ${taxi.catalog}.nyc_taxi_silver.load_batches
 ),
 trip_keys AS (
-  SELECT trip_id, min(batch_seq) AS first_batch, min(pickup_datetime) AS pickup_datetime
+  SELECT trip_id, min(batch_seq) AS first_batch, min(pickup_datetime) AS pickup_datetime,
+         date_trunc('MONTH', min(pickup_datetime)) AS pickup_month
   FROM candidates
   GROUP BY trip_id
 ),
+-- Load b merges trip k iff b = 1 or k.pickup_datetime > H(b). Loads whose H(b) is
+-- before k's pickup month always qualify (month_base); only loads whose H(b) falls
+-- inside that month need the timestamp comparison (month_steps). Both joins to
+-- trip_keys are equi-joins on the month, so the cost no longer grows with
+-- trips x loads (the old single non-equi join ran as a broadcast nested loop).
+month_base AS (
+  SELECT m.pickup_month, max(b.batch_seq) AS base_batch
+  FROM (SELECT DISTINCT pickup_month FROM trip_keys) AS m
+  JOIN batches AS b ON b.batch_seq = 1 OR b.hwm < m.pickup_month
+  GROUP BY m.pickup_month
+),
+month_steps AS (
+  SELECT batch_seq, hwm, date_trunc('MONTH', hwm) AS hwm_month FROM batches
+),
 last_merge AS (
-  SELECT k.trip_id, max(b.batch_seq) AS last_merge_batch
+  SELECT /*+ BROADCAST(mb, s) */ k.trip_id, greatest(mb.base_batch, coalesce(max(s.batch_seq), 0)) AS last_merge_batch
   FROM trip_keys AS k
-  JOIN batches AS b
-    ON b.batch_seq = 1 OR k.pickup_datetime > coalesce(b.hwm, TIMESTAMP '1900-01-01')
-  GROUP BY k.trip_id, k.first_batch
-  HAVING max(b.batch_seq) >= k.first_batch
+  JOIN month_base AS mb ON mb.pickup_month = k.pickup_month
+  LEFT JOIN month_steps AS s ON s.hwm_month = k.pickup_month AND k.pickup_datetime > s.hwm
+  GROUP BY k.trip_id, k.first_batch, mb.base_batch
+  HAVING greatest(mb.base_batch, coalesce(max(s.batch_seq), 0)) >= k.first_batch
 ),
 trips AS (
   SELECT c.*

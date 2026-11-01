@@ -21,6 +21,13 @@ resources:
       properties:
         devin: "true"
         source_module: 04-analytics-engineering
+    nyc_taxi_ops:
+      catalog_name: ${var.catalog}
+      name: nyc_taxi_ops
+      comment: "Ops: refresh-time metrics and quarantine counts written by the check_refresh task"
+      properties:
+        devin: "true"
+        source_module: ops
 
   volumes:
     landing:

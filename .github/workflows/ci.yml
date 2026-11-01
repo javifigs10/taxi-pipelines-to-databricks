@@ -1,0 +1,50 @@
+# Runs on every PR against main. Nothing here starts Databricks compute:
+# - checks: ruff + the DBU-free tests (bundle seed drift, fct_trips rewrite equivalence on DuckDB)
+# - bundle-validate: `databricks bundle validate` (workspace API only), authenticated with GitHub OIDC
+#   through a Databricks service-principal federation policy. No Databricks secret is stored anywhere.
+#   Setup (one-off, account admin): docs/operations/permissions.md#ci-identity
+# The parity suite and PARITY_RERUN tests need serverless compute and stay manual.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "ruff==0.17.*" "pytest>=8,<9" "duckdb>=1.2,<3"
+      - run: ruff check databricks tests
+      - run: pytest -q tests/unit tests/parity/test_bundle_seeds.py
+
+  bundle-validate:
+    runs-on: ubuntu-latest
+    # id-token isn't issued to PRs from forks; the federation policy only trusts this repo anyway.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.DATABRICKS_CI_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check OIDC setup
+        if: env.DATABRICKS_HOST == '' || env.DATABRICKS_CLIENT_ID == ''
+        run: echo "::warning::bundle validate SKIPPED - set repository variables DATABRICKS_HOST and DATABRICKS_CI_CLIENT_ID (not secrets), see docs/operations/permissions.md#ci-identity"
+      - uses: databricks/setup-cli@v1.23.0
+        if: env.DATABRICKS_HOST != '' && env.DATABRICKS_CLIENT_ID != ''
+      - if: env.DATABRICKS_HOST != '' && env.DATABRICKS_CLIENT_ID != ''
+        run: databricks current-user me
+      - if: env.DATABRICKS_HOST != '' && env.DATABRICKS_CLIENT_ID != ''
+        run: databricks bundle validate
+        working-directory: databricks

@@ -51,7 +51,7 @@ def define_bronze(taxi: str) -> None:
         comment=f"Kestra 08_gcp_taxi {taxi}_tripdata: monthly csv.gz via Auto Loader",
         table_properties=TAGS,
     )
-    @dp.expect_or_fail("filename_is_monthly_file", rf"filename rlike '^{taxi}_tripdata_[0-9]{{4}}-[0-9]{{2}}\.csv$'")
+    @dp.expect("filename_is_monthly_file", rf"filename rlike '^{taxi}_tripdata_[0-9]{{4}}-[0-9]{{2}}\.csv$'")
     @dp.expect("no_rescued_data", "_rescued_data is null")
     def bronze():
         raw = (
