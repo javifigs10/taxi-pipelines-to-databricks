@@ -10,6 +10,8 @@ resources:
         devin: "true"
         source_module: 04-analytics-engineering
       max_concurrent_runs: 1
+      run_as:
+        service_principal_name: ${var.run_as_sp}
       email_notifications:
         on_failure:
           - ${var.alert_email}

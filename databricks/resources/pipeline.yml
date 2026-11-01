@@ -5,6 +5,8 @@ resources:
       catalog: ${var.catalog}
       schema: ${resources.schemas.nyc_taxi_silver.name}
       serverless: true
+      run_as:
+        service_principal_name: ${var.run_as_sp}
       channel: CURRENT
       photon: true
       continuous: false

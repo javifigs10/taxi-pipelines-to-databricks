@@ -9,8 +9,8 @@
 | catalog `devin_dev` | owner | catalog created by javifigs10@gmail.com, ownership transferred to the principal |
 | catalog `devin_dev` | `ALL_PRIVILEGES` | direct grant; inherited by every schema, table, MV and volume |
 | schemas `nyc_taxi_{bronze,silver,gold,ops}`, `dbt_ref`, `dbt_ref_src` | owner | created by the principal (bundle, dbt) |
-| volume `nyc_taxi_bronze.landing`, all tables and MVs | owner | created by the principal (bundle, pipeline, dbt, `check_refresh`) |
-| pipeline `nyc_taxi`, job `nyc_taxi_daily` | `IS_OWNER`, run-as | bundle deploy |
+| volume `nyc_taxi_bronze.landing`, all tables and MVs | owner | created by the principal (bundle, pipeline, dbt, `check_refresh`). Since 2026-11-01 the 31 pipeline tables are owned by `devin-operate` (section 3) |
+| pipeline `nyc_taxi`, job `nyc_taxi_daily` | `IS_OWNER` (run-as until 2026-11-01, now `devin-operate`, see section 3) | bundle deploy |
 | warehouse `Serverless Starter Warehouse` | `CAN_USE` via `users` (per the workspace owner; the principal can't read the warehouse ACL) | group |
 | workspace | entitlements `workspace-access`, `databricks-sql-access`, `workspace-consume`; group `users`; not an admin | |
 
@@ -39,40 +39,69 @@
 
 So 11 of the 17 catalog privileges were used, but only 3 are needed once things are running (section 3). The remaining 8 belong to building and testing, not operating.
 
-## 3. Minimum set: operate profile
+## 3. Minimum set: operate profile (proven with `devin-operate`)
 
-The operate identity is the job and pipeline **run-as**. It refreshes data, writes metrics, tags tables and nothing else. It doesn't deploy, create schemas, grant, or run parity. The pipeline owner owns the tables it creates, so most access comes from ownership rather than grants.
+The operate identity is the job and pipeline **run-as**. It refreshes data, writes metrics, tags tables and nothing else. It doesn't deploy, create schemas, grant, or run parity. It is `devin-operate` (`6432d72f-…`), created by the workspace owner with the `workspace-access` entitlement and nothing else, and wired in through `var.run_as_sp` in `databricks.yml`.
+
+**How it was proven (2026-11-01).** I granted exactly the profile derived in the first draft of this doc, deployed with `run_as` set to `devin-operate`, ran `nyc_taxi_daily` with `month=2019-02`, and added only what a real failure asked for:
+
+| # | Run | Failed with | Added |
+|---|---|---|---|
+| 1 | job run `706773312798563` | `download_month`: *Cannot read the python file /Workspace/Users/e63a8604-…/.bundle/nyc_taxi/dev/files/src/tasks/download_month.py … the identity used to run this job, 6432d72f-…, lacks the required permissions* | read on the bundle's workspace folder |
+| 2 | job run `512986504017596` | `refresh_pipeline`: *User 6432d72f-… does not have Run permissions on pipeline 58fb3a98-…* | `CAN_RUN` on the pipeline |
+| 3 | job run `402228683487201` | `check_refresh`: *PERMISSION_DENIED: Principal 'devin-operate' does not have SELECT on Table 'devin_dev.nyc_taxi_ops.refresh_metrics'* | `SELECT, MODIFY` on the two `nyc_taxi_ops` tables |
+| ✓ | repair of `402228683487201` (`check_refresh` only), then full refresh `1d690743` | — | all tasks and a full refresh green as `devin-operate` |
+
+So the first draft was **short by three, and all three came from outside what I'd modelled**: two are workspace permissions (not Unity Catalog at all) and one comes from table ownership history.
+
+**The proven set.** Unity Catalog:
 
 ```sql
--- `nyc-taxi-operate` = a new service principal (needs an account/workspace admin to create)
-GRANT USE CATALOG ON CATALOG devin_dev TO `nyc-taxi-operate`;
+-- devin-operate = 6432d72f-ea90-4201-a365-27d358d9f0ff
+GRANT USE CATALOG ON CATALOG devin_dev TO `6432d72f-ea90-4201-a365-27d358d9f0ff`;
 GRANT USE SCHEMA, CREATE TABLE, CREATE MATERIALIZED VIEW, APPLY TAG
-  ON SCHEMA devin_dev.nyc_taxi_bronze TO `nyc-taxi-operate`;
+  ON SCHEMA devin_dev.nyc_taxi_bronze TO `6432d72f-ea90-4201-a365-27d358d9f0ff`;
 GRANT USE SCHEMA, CREATE TABLE, CREATE MATERIALIZED VIEW, APPLY TAG
-  ON SCHEMA devin_dev.nyc_taxi_silver TO `nyc-taxi-operate`;
+  ON SCHEMA devin_dev.nyc_taxi_silver TO `6432d72f-ea90-4201-a365-27d358d9f0ff`;
 GRANT USE SCHEMA, CREATE TABLE, CREATE MATERIALIZED VIEW, APPLY TAG
-  ON SCHEMA devin_dev.nyc_taxi_gold TO `nyc-taxi-operate`;
-GRANT USE SCHEMA, CREATE TABLE, APPLY TAG ON SCHEMA devin_dev.nyc_taxi_ops TO `nyc-taxi-operate`;
-GRANT READ VOLUME, WRITE VOLUME ON VOLUME devin_dev.nyc_taxi_bronze.landing TO `nyc-taxi-operate`;
+  ON SCHEMA devin_dev.nyc_taxi_gold TO `6432d72f-ea90-4201-a365-27d358d9f0ff`;
+GRANT USE SCHEMA, CREATE TABLE, APPLY TAG ON SCHEMA devin_dev.nyc_taxi_ops TO `6432d72f-ea90-4201-a365-27d358d9f0ff`;
+GRANT READ VOLUME, WRITE VOLUME ON VOLUME devin_dev.nyc_taxi_bronze.landing TO `6432d72f-ea90-4201-a365-27d358d9f0ff`;
+-- added after failure 3: these two tables were created by Devin's earlier check runs
+GRANT SELECT, MODIFY ON TABLE devin_dev.nyc_taxi_ops.refresh_metrics   TO `6432d72f-ea90-4201-a365-27d358d9f0ff`;
+GRANT SELECT, MODIFY ON TABLE devin_dev.nyc_taxi_ops.quarantine_counts TO `6432d72f-ea90-4201-a365-27d358d9f0ff`;
 ```
 
-- **Why these:**
-  - `CREATE TABLE` / `CREATE MATERIALIZED VIEW` are needed because the pipeline creates or replaces its datasets on a definition change.
-  - The volume grants are for `download_month` and Auto Loader.
-  - `nyc_taxi_ops` is where `check_refresh` creates its two tables on the first run; after that it owns them.
-  - `APPLY TAG` is for `apply_tags`.
-- **No `SELECT` or `MODIFY` grants:** everything it reads or writes, it owns: the pipeline tables, the event log and the ops tables.
-- **Workspace:** the `workspace-access` entitlement only. It needs no warehouse (job tasks and the pipeline run on serverless jobs compute) and no `databricks-sql-access`.
-- **Ownership:** it should own the pipeline and job (or be their run-as), so the tables it creates are its own. `CAN_MANAGE_RUN` on the job goes to the on-call humans, not to this principal.
-- **Deliberately not in this profile:** `CREATE SCHEMA`, `CREATE VOLUME`, `MANAGE`, catalog ownership, `dbt_ref*`, `CREATE FUNCTION`/`MODEL`, warehouse `CAN_USE`.
-- **Not tested:** derived from what each task does. Proving it needs the new principal: deploy with `run_as` set to it, run the job once, and see if anything fails with `PERMISSION_DENIED`.
+Workspace (in the bundle, so it is re-applied on every deploy):
+
+```yaml
+# databricks.yml, added after failures 1 and 2
+permissions:
+  - service_principal_name: ${var.run_as_sp}
+    level: CAN_RUN
+```
+
+Top-level `CAN_RUN` turns into `CAN_READ` on the bundle folder (failure 1), `CAN_RUN` on the pipeline (failure 2) and `CAN_MANAGE_RUN` on the job. The last one wasn't asked for by any failure; it's the side effect of fixing both in one bundle-native line. The alternative (a folder ACL plus a pipeline-only permission) can't be expressed in the bundle and would drift.
+
+Plus, outside the catalog:
+- **Entitlement:** `workspace-access` only. Proven: no `databricks-sql-access`, no warehouse, no cluster policy. Serverless job tasks and the serverless pipeline started without them.
+- **For whoever deploys:** the "Service Principal: User" role on `devin-operate`. Databricks refuses to set `run_as` to a principal you can't use. That's on the deploy profile, not on operate.
+
+**What changed on the workspace when `run_as` switched:**
+- **Table ownership moved.** All 31 pipeline tables (streaming tables, MVs, their `__materialization_*` tables and the event log) went from `Devin` to `devin-operate` on deploy, as the Databricks docs describe. Schemas, the volume, the job and the pipeline stay owned by `Devin` (the deploy identity).
+- **The event log closed to everyone but its owner.** After the switch, `Devin` got `INSUFFICIENT_PERMISSIONS … does not have SELECT on Table … event_log_58fb3a98…` despite `ALL_PRIVILEGES` on the catalog. `check_refresh` is unaffected (it runs as the owner). For ad hoc analysis from another identity, use the pipeline events API (`databricks pipelines list-pipeline-events`, pipeline `CAN_VIEW` is enough), or have the owner grant `SELECT`.
+- **On a fresh deploy, the two `nyc_taxi_ops` table grants aren't needed:** `check_refresh` would create those tables as `devin-operate` on its first run and own them. They're in the list because this workspace has history; I chose a grant over an ownership transfer because ownership also carries `MANAGE`.
+
+**What the proof does and doesn't show.** The set is proven **sufficient**: every task in the job and a full refresh ran as `devin-operate` with nothing else. I haven't proven each item is **necessary**. The pre-existing grants were never removed one at a time, which would take one pipeline run per grant. `CREATE TABLE` on the target schemas is listed as required in the Databricks run-as docs. `CREATE MATERIALIZED VIEW` and `APPLY TAG` follow from what the pipeline and `apply_tags` do.
+
+- **Deliberately not in this profile:** `CREATE SCHEMA`, `CREATE VOLUME`, `MANAGE`, catalog ownership, `dbt_ref*`, `CREATE FUNCTION`/`MODEL`, warehouse `CAN_USE`, `databricks-sql-access`.
 
 ## 4. The other profiles
 
 | Profile | Who | Needs |
 |---|---|---|
-| **deploy** | whoever runs `bundle deploy` (a person or a CD principal) | owner of the four `nyc_taxi_*` schemas and the volume (or `CREATE SCHEMA` / `CREATE VOLUME` on the catalog to create them), workspace-access. Sets `run_as` to the operate principal. |
-| **parity / test** | the person or principal running `tests/parity` | `USE CATALOG`; `USE SCHEMA` + `SELECT` on `nyc_taxi_*`; `USE SCHEMA` + `CREATE TABLE` on `dbt_ref`, `dbt_ref_src`; warehouse `CAN_USE`; serverless compute. The opt-in rerun test also needs `CAN_RUN` on the pipeline. |
+| **deploy** | whoever runs `bundle deploy` (a person or a CD principal) | owner of the four `nyc_taxi_*` schemas and the volume (or `CREATE SCHEMA` / `CREATE VOLUME` on the catalog to create them), workspace-access, and the "Service Principal: User" role on `devin-operate` (proven: `run_as` is set by it). |
+| **parity / test** | the person or principal running `tests/parity` | `USE CATALOG`; `USE SCHEMA` + `SELECT` on `nyc_taxi_*`; `USE SCHEMA` + `CREATE TABLE` on `dbt_ref`, `dbt_ref_src`; warehouse `CAN_USE`; serverless compute. The opt-in rerun test also needs `CAN_RUN` on the pipeline. Since the run-as switch the pipeline tables are owned by `devin-operate`, so this profile needs an explicit `SELECT` (Devin gets it from catalog `ALL_PRIVILEGES`), and it can't read the event log. |
 | **CI** (`bundle validate`) | GitHub Actions via OIDC | workspace-access only. No Unity Catalog grants and no warehouse: validate never touches data. See below. |
 | **reader** | javifigs10@gmail.com | `USE CATALOG`, `USE SCHEMA`, `SELECT` on `devin_dev` (in place today) |
 

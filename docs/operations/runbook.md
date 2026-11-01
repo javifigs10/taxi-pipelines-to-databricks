@@ -1,6 +1,6 @@
 # Runbook: `nyc_taxi_daily` alert
 
-One page, for whoever gets paged. Workspace `dbc-b50571e1-447f`, catalog `devin_dev`, job `nyc_taxi_daily` (52470242913383), pipeline `nyc_taxi` (58fb3a98-398f-4eae-b809-2e1e1714eb0a). Consumers read gold after 08:00 UTC; the job starts at 06:00 UTC.
+One page, for whoever gets paged. Workspace `dbc-b50571e1-447f`, catalog `devin_dev`, job `nyc_taxi_daily` (52470242913383), pipeline `nyc_taxi` (58fb3a98-398f-4eae-b809-2e1e1714eb0a). Both run as `devin-operate` (`6432d72f-…`), which owns the pipeline tables and the event log; a `PERMISSION_DENIED` in any task is a grant problem, not a data problem (see `permissions.md` section 3). Consumers read gold after 08:00 UTC; the job starts at 06:00 UTC.
 
 ## 1. Which alert is it? (2 minutes)
 
