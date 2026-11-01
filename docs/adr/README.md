@@ -31,5 +31,6 @@ Format: Context, Decision, Consequences (good, bad, at scale, for cutover), Evid
 | [ADR-0019](0019-s8-input-is-bronze.md) | S8 | Spark report reads bronze, not the raw files | Accepted |
 | [ADR-0020](0020-quarantine-row-level-failures.md) | ops | Quarantine rows that break row-level checks instead of failing the update | Accepted |
 | [ADR-0021](0021-fct-trips-month-bucketed-last-merge.md) | B1 | Month-bucketed last-merge lookup in `fct_trips` | Accepted |
+| [ADR-0022](0022-load-order-ledger.md) | B1, bronze | Record load order in an append-only landing ledger, not file modification times (**bronze contract change**) | **Proposed** |
 
 Related: [scaling.md](../architecture/scaling.md), [cutover-and-rollback.md](../architecture/cutover-and-rollback.md).
